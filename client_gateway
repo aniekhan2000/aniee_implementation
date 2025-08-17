@@ -1,0 +1,51 @@
+# client_gateway.py
+
+import torch
+from model.cnn_model import CIFAR10CNN
+from client.phase1_cifar_client import phase1_client
+
+def client_gateway(
+    cid,
+    global_model,
+    encoder,
+    decoder,
+    data_loader,
+    malicious=False,
+    round_num=1,
+    total_clients=10
+):
+    """
+    Client-side gateway that performs local update and returns latent vector + stats.
+    Compatible with adaptive_server pipeline.
+    """
+
+    print(f"🌐 Client Gateway [{cid}] starting...")
+
+    # Step 1: Load the client model with global weights
+    model = CIFAR10CNN()
+    model.load_state_dict(global_model)
+
+    # Step 2: Run local update (training or simulation)
+    try:
+        result = phase1_client(
+            client_id=cid,
+            global_model=global_model,
+            encoder=encoder,
+            decoder=decoder,
+            clip_norm=1.0,
+            sigma=0.2,
+            round_num=round_num,
+            total_clients=total_clients,
+            malicious=malicious
+        )
+    except Exception as e:
+        print(f"❌ Client {cid} failed during local update: {e}")
+        return None
+
+    # Step 3: Return update in standardized format
+    print(f"📤 Client {cid} → sending latent vector to server")
+    return {
+        "z_tilde": result["z_tilde"],
+        "mag_orig": result["mag_orig"],
+        "r_norm": result["r_norm"]
+    }
