@@ -1,0 +1,162 @@
+# server/server_utils.py
+
+import torch
+import torch.nn.functional as F
+from collections import Counter
+
+# ---------- Vector <-> state_dict ----------
+def state_dict_to_vector(state_dict: dict) -> torch.Tensor:
+    """Flatten a state_dict into a 1-D torch tensor."""
+    return torch.cat([p.reshape(-1) for p in state_dict.values()])
+
+
+def vector_to_state_dict(vector, state_dict_template: dict) -> dict:
+    """
+    Convert a flat vector (torch tensor or numpy array) into a state_dict
+    shaped like `state_dict_template`. Dtype/device follow the template.
+    """
+    if not isinstance(vector, torch.Tensor):
+        vector = torch.tensor(vector, dtype=torch.float32)
+    vector = vector.view(-1)
+
+    new_state = {}
+    idx = 0
+    total = vector.numel()
+    for k, t in state_dict_template.items():
+        n = t.numel()
+        if idx + n > total:
+            raise ValueError(f"Flat vector too short: need {idx+n}, have {total}")
+        piece = vector[idx:idx+n].to(dtype=t.dtype, device=t.device).view_as(t).clone()
+        new_state[k] = piece
+        idx += n
+
+    if idx != total:
+        raise ValueError(f"Flat vector too long: used {idx}, have {total}")
+    return new_state
+
+
+# ---------- Basic metrics ----------
+def compute_magnitude(z: torch.Tensor) -> float:
+    """L2 norm as a Python float."""
+    return torch.norm(z).item()
+
+
+def compute_distance(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Euclidean distance as a Python float."""
+    return torch.norm(a - b).item()
+
+
+def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Cosine similarity in a numerically stable way, as a float."""
+    a = a.view(-1)
+    b = b.view(-1)
+    if a.numel() == 0 or b.numel() == 0:
+        return 0.0
+    return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=1, eps=1e-8).item()
+
+
+# ---------- Jitter ----------
+def apply_jitter(z: torch.Tensor, noise_std: float = 0.01, k: int = 5):
+    """Generate k jittered versions of z by adding Gaussian noise."""
+    return [z + torch.randn_like(z) * noise_std for _ in range(k)]
+
+
+# ---------- Label helpers ----------
+def update_label(c_i: int) -> str:
+    """Map criteria count to a label."""
+    if c_i == 3:
+        return "Benign"
+    elif c_i == 2:
+        return "Diverse"
+    else:
+        return "Malicious"
+
+
+# ---------- Weights ----------
+def compute_weight(label: str, c_i: int, r_norm: float, flip_rate: float,
+                   w_honest: float, w_diverse: float, alpha: float) -> float:
+    """
+    Aggregation weight based on final label & metrics.
+    - Treat 'Honest' same as 'Benign' for compatibility with your classifier.
+    - Penalize Diverse by flip-rate (and optionally r_norm, uncomment if needed).
+    """
+    lab = (label or "").lower()
+    if lab in ("benign", "honest"):
+        w = w_honest
+    elif lab == "diverse":
+        w = w_diverse * (1.0 - alpha * min(1.0, float(flip_rate)))
+    elif lab == "malicious":
+        w = 0.0
+    else:  # "Pending" or unknown
+        w = 0.5
+    return float(max(0.0, min(w, w_honest)))
+
+
+# ---------- EMA ----------
+class EMA:
+    def __init__(self, alpha=0.1):
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, x):
+        if self.value is None:
+            self.value = x.clone()
+        else:
+            self.value = self.alpha * x + (1 - self.alpha) * self.value
+        return self.value
+
+
+# ---------- Anchors ----------
+def update_anchors(anchors, new_z: torch.Tensor, alpha: float = 0.1):
+    """
+    Keep a single EMA anchor by default. Extend to multiple anchors if you cluster.
+    """
+    if not anchors:
+        return [new_z.detach()]
+    anchors = list(anchors)
+    anchors[0] = (1 - alpha) * anchors[0] + alpha * new_z
+    return anchors
+
+
+# ---------- Simple classifier ----------
+def classify_client(z: torch.Tensor, anchors, ε_mag_lat: float, τ_dir_lat: float,
+                    k_out: float, k_in: float, τ_rec_high: float, τ_rec_low: float,
+                    jitter_thresh: float, label_history: dict, client_id: int, m_confirm: int,
+                    r_norm: float = None):
+    """
+    Very simple placeholder; align labels to Benign/Diverse/Malicious.
+    """
+    mag_z = compute_magnitude(z)
+
+    if anchors:
+        dists = [compute_distance(z, a) for a in anchors]
+        dirs = [cosine_similarity(z, a) for a in anchors]
+        closest_idx = int(torch.tensor(dists).argmin().item())
+        closest_anchor_dist = dists[closest_idx]
+        closest_anchor_dir = dirs[closest_idx]
+    else:
+        closest_anchor_dist = 0.0
+        closest_anchor_dir = 1.0
+
+    cond_mag = (mag_z <= ε_mag_lat)
+    cond_dir = (closest_anchor_dir >= τ_dir_lat)
+    cond_in = (closest_anchor_dist <= k_in)
+    cond_out = (closest_anchor_dist >= k_out)
+
+    if cond_mag and cond_dir and cond_in:
+        label = "Benign"
+    elif cond_mag and (cond_dir or cond_out):
+        label = "Diverse"
+    else:
+        label = "Malicious"
+
+    # history confirmation
+    label_history.setdefault(client_id, [])
+    label_history[client_id].append(label)
+    recent = label_history[client_id][-m_confirm:]
+    if len(recent) == m_confirm:
+        most, cnt = Counter(recent).most_common(1)[0]
+        if cnt == m_confirm:
+            label = most
+
+    return label
