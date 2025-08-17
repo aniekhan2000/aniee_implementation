@@ -1,0 +1,94 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from model.cnn_model import CIFAR10CNN
+from utils.utils import load_data
+from utils.encoder import LinearEncoder, LinearDecoder
+import numpy as np
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def train_local(model, trainloader, epochs=1):
+    model.train()
+    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    criterion = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        for x, y in trainloader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            optimizer.zero_grad()
+            out = model(x)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+
+
+def compute_flat_update(model, global_weights):
+    local_weights = model.state_dict()
+    update = {k: local_weights[k] - global_weights[k] for k in global_weights}
+    flat_update = torch.cat([v.flatten() for v in update.values()])
+    return flat_update
+
+
+def clip_update(update, clip_norm):
+    norm = torch.norm(update)
+    scale = min(1.0, clip_norm / (norm + 1e-8))
+    return update * scale, norm.item()
+
+
+def add_dp_noise(z, sigma):
+    return z + torch.randn_like(z) * sigma
+
+
+def phase1_client(
+    client_id,
+    global_model,
+    encoder,
+    decoder=None,
+    clip_norm=1.0,
+    sigma=0.1,
+    mean_r=0.0,
+    std_r=1.0,
+    malicious=False,
+    round_num=1,
+    total_clients=5,
+):
+    trainset, _ = load_data()
+
+    # Split dataset among clients
+    data_size = len(trainset) // total_clients
+    indices = list(range(client_id * data_size, (client_id + 1) * data_size))
+    client_data = Subset(trainset, indices)
+    trainloader = DataLoader(client_data, batch_size=32, shuffle=True)
+
+    model = CIFAR10CNN().to(DEVICE)
+    model.load_state_dict(global_model)
+
+    train_local(model, trainloader, epochs=1)
+
+    update = compute_flat_update(model, global_model)
+
+    if malicious:
+        print(f"⚠️ Client {client_id} is malicious in round {round_num}")
+        update = update * 10  # amplify update (malicious)
+
+    clipped_update, mag_orig = clip_update(update, clip_norm)
+    z = encoder(clipped_update)
+
+    if decoder is not None:
+        recon = decoder(z)
+        rec_loss = torch.norm(clipped_update - recon)
+        r_norm = (rec_loss.item() - mean_r) / (std_r + 1e-8)
+    else:
+        r_norm = 0.0
+
+    z_tilde = add_dp_noise(z, sigma)
+
+    return {
+        "client_id": client_id,
+        "z_tilde": z_tilde.detach().cpu(),
+        "mag_orig": mag_orig,
+        "r_norm": r_norm,
+        "round": round_num,
+    }
