@@ -1,0 +1,44 @@
+# main.py (Phase 0, 10, 11)
+
+import flwr as fl
+from server.adaptive_server import adaptive_server
+from client.phase1_cifar_client import phase1_cifar_client
+import torch
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from model.cnn_model import cnn_model
+
+
+# Phase 0 - Initialization
+def load_data():
+    transform = transforms.Compose([transforms.ToTensor()])
+    trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    testset = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    return trainset, testset
+
+
+trainset, testset = load_data()
+
+
+# Client creation function
+def client_fn(cid):
+    client = phase1_cifar_client(cid, trainset)
+    client.model = cnn_model()
+    return client
+
+
+# Server strategy
+strategy = adaptive_server(model=cnn_model())
+
+
+# Phase 10 - Start FL simulation
+fl.simulation.start_simulation(
+    client_fn=client_fn,
+    num_clients=5,
+    config=fl.server.ServerConfig(num_rounds=3),
+    strategy=strategy,
+)
+
+
+# Phase 11 - Logging placeholder
+print("[INFO] Simulation complete. Logs can be extended here.")
