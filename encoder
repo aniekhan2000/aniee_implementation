@@ -1,0 +1,19 @@
+import torch.nn as nn
+
+
+class LinearEncoder(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super().__init__()
+        self.fc = nn.Linear(input_dim, latent_dim)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class LinearDecoder(nn.Module):
+    def __init__(self, latent_dim, output_dim):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim, output_dim)
+
+    def forward(self, z):
+        return self.fc(z)
