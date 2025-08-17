@@ -1,0 +1,65 @@
+#----------------------------------------------CLIENT SIMULATION--------------------------------------------------
+import random
+from model.cnn_model import CIFAR10CNN
+from utils.encoder import LinearEncoder, LinearDecoder
+from client.phase1_cifar_client import phase1_client
+from server.adaptive_server import adaptive_server
+from server.server_utils import (
+compute_magnitude,
+compute_distance,
+cosine_similarity,
+apply_jitter,
+update_label,
+compute_weight,
+vector_to_state_dict,
+)
+
+# Step 1: Initialize temporary model to get parameter count
+temp_model = CIFAR10CNN() # ✅ use the same name you imported
+num_params = sum(p.numel() for p in temp_model.parameters())
+
+# Step 2: Initialize Encoder and Decoder (using positional arguments)
+encoder = LinearEncoder(num_params, 128)
+decoder = LinearDecoder(128, num_params)
+
+# Step 3: Initialize Global Model State
+global_model = temp_model.state_dict()
+
+# Step 4: Federated Setup
+num_clients = 5
+num_malicious = 2 # You can change this to how many you want
+num_rounds = 5
+
+# Step 5: Federated Rounds
+for rnd in range(num_rounds):
+ print(f"\n🌀 Round {rnd + 1}")
+
+# ✅ Randomly select malicious clients for this round
+ malicious_clients = random.sample(range(num_clients), k=num_malicious)
+ print(f"Malicious clients for round {rnd + 1}: {malicious_clients}")
+
+ for cid in range(num_clients):
+  result = phase1_client(
+client_id=cid,
+global_model=global_model,
+encoder=encoder,
+decoder=decoder,
+clip_norm=1.0,
+sigma=0.2,
+round_num=rnd + 1,
+total_clients=num_clients
+ )
+
+#--------------------------------SERVER SIMULATION------------------------------------------
+from server.adaptive_server import adaptive_server
+
+# Only pass ground truth malicious_clients to simulate poisoned updates;
+# server will try to detect them using encoded z_i only.
+adaptive_server(
+    num_rounds=3,
+    num_clients=5,
+    malicious_clients=[0, 3],  # known only to clients (not to server logic)
+    latent_dim=128
+)
+
+ print(f"Client {cid} → mag: {result['mag_orig']:.2f} | r_norm: {result['r_norm']:.4f}")
