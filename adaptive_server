@@ -1,0 +1,192 @@
+import torch
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+
+from server.server_utils import (
+    vector_to_state_dict,
+    compute_magnitude,
+    compute_distance,
+    cosine_similarity,
+    apply_jitter,
+    update_label,
+    compute_weight,
+    EMA,
+)
+from model.cnn_model import CIFAR10CNN
+from utils.encoder import LinearEncoder, LinearDecoder
+from client.client_gateway import client_gateway
+
+
+def get_client_dataloaders(dataset, num_clients, batch_size=32):
+    """Split dataset into subsets for clients"""
+    client_loaders = []
+    data_per_client = len(dataset) // num_clients
+    indices = np.random.permutation(len(dataset))
+
+    for i in range(num_clients):
+        start = i * data_per_client
+        end = (i + 1) * data_per_client if i != num_clients - 1 else len(dataset)
+        subset = Subset(dataset, indices[start:end])
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
+        client_loaders.append(loader)
+
+    return client_loaders
+
+
+def adaptive_server(num_rounds=5, num_clients=10, malicious_clients=None, latent_dim=128):
+    if malicious_clients is None:
+        malicious_clients = []
+
+    model = CIFAR10CNN()
+    num_params = sum(p.numel() for p in model.parameters())
+    global_model = model.state_dict()
+
+    encoder = LinearEncoder(num_params, latent_dim)
+    decoder = LinearDecoder(latent_dim, num_params)
+
+    label_history = {i: [] for i in range(num_clients)}
+
+    # --- EMA Initialization ---
+    ema_mu_z_short = EMA(alpha=0.1)
+    ema_sigma_z_short = EMA(alpha=0.1)
+    ema_mu_z_long = EMA(alpha=0.01)
+
+    # Hyperparameters
+    τ_dir_lat = 0.8
+    τ_rec_high = 180
+    τ_rec_low = 150
+    jitter_thresh = 0.3
+    m_confirm = 3
+    w_honest, w_diverse = 1.0, 0.7
+    alpha = 0.1
+
+    # === Dataset Setup ===
+    transform = transforms.Compose([transforms.ToTensor()])
+    trainset = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+    client_dataloaders = get_client_dataloaders(trainset, num_clients)
+
+    for rnd in range(num_rounds):
+        print(f"\n🌐 Round {rnd+1}")
+        z_list, rnorms, mags, labels, weights, client_results = [], [], [], [], [], []
+
+        for cid in range(num_clients):
+            try:
+                data_loader = client_dataloaders[cid]
+                result = client_gateway(
+                    cid=cid,
+                    global_model=global_model,
+                    encoder=encoder,
+                    decoder=decoder,
+                    data_loader=data_loader,
+                    malicious=(cid in malicious_clients),
+                    round_num=rnd + 1,
+                    total_clients=num_clients,
+                )
+
+                if result is None:
+                    raise ValueError("Client returned None")
+
+                client_results.append(result)
+                print(f"Client {cid} → mag: {result['mag_orig']:.2f} | r_norm: {result['r_norm']:.4f}")
+            except Exception as e:
+                print(f"❌ Client {cid} failed: {e}")
+
+        if not client_results:
+            print("No client results this round; skipping.")
+            continue
+
+        # --- EMA Update Block ---
+        z_tensor = torch.stack([r["z_tilde"] for r in client_results])
+        mu_z_batch = torch.mean(z_tensor, dim=0)
+        sigma_z_batch = torch.std(z_tensor, dim=0)
+
+        mu_z_short = ema_mu_z_short.update(mu_z_batch)
+        sigma_z_short = ema_sigma_z_short.update(sigma_z_batch)
+        mu_z_long = ema_mu_z_long.update(mu_z_batch)
+
+        print(f"[EMA] μ_z_short norm: {mu_z_short.norm():.4f} | σ_z_short avg: {sigma_z_short.mean():.4f}")
+
+        # Adaptive thresholds
+        ε_mag_lat = sigma_z_short.mean().item() * 10
+        k_out = sigma_z_short.mean().item() * 20
+        k_in = sigma_z_short.mean().item() * 10
+
+        for i, result in enumerate(client_results):
+            z = result["z_tilde"]
+            r_norm = result["r_norm"]
+            mag_z = compute_magnitude(z)
+
+            mu_z = mu_z_short
+            dist_norm = compute_distance(z, mu_z)
+
+            # 3-Criteria Eval
+            cond_mag = mag_z <= ε_mag_lat
+            cond_dir = cosine_similarity(z, mu_z) >= τ_dir_lat
+            prev_label = label_history[i][-1] if label_history[i] else None
+            cond_bound = dist_norm <= (k_in if prev_label == "Benign" else k_out)
+            c_i = int(cond_mag) + int(cond_dir) + int(cond_bound)
+            L0 = update_label(c_i)
+
+            # Reconstruction adjustment
+            if L0 == "Benign" and r_norm > τ_rec_high:
+                L1 = "Diverse"
+            elif L0 == "Diverse" and r_norm < τ_rec_low:
+                L1 = "Diverse"
+            else:
+                L1 = L0
+
+            # Jitter Test
+            flips = 0
+            for jittered in apply_jitter(z):
+                dir_sim = cosine_similarity(jittered, mu_z)
+                mag_sim = compute_magnitude(jittered)
+                dist_sim = compute_distance(jittered, mu_z)
+                jitter_c = int(mag_sim <= ε_mag_lat) + int(dir_sim >= τ_dir_lat) + int(dist_sim <= k_out)
+                jitter_label = update_label(jitter_c)
+                if jitter_label != L1:
+                    flips += 1
+            flip_rate = flips / 5
+            L3 = "Diverse" if flip_rate > jitter_thresh else L1
+
+            # Stability confirmation
+            label_history[i].append(L3)
+            if len(label_history[i]) > m_confirm:
+                label_history[i] = label_history[i][-m_confirm:]
+            confirmed = all(l == label_history[i][0] for l in label_history[i])
+            final_label = label_history[i][0] if confirmed else "Pending"
+
+            weight = compute_weight(final_label, c_i, r_norm, flip_rate, w_honest, w_diverse, alpha)
+
+            print(f"Client {i} → Label: {final_label}, Weight: {weight:.4f}, mag: {mag_z:.2f}, r_norm: {r_norm:.2f}")
+
+            z_list.append(z * weight)
+            mags.append(mag_z)
+            rnorms.append(r_norm)
+            labels.append(final_label)
+            weights.append(weight)
+
+        detected_malicious = [i for i, lbl in enumerate(labels) if lbl.lower() == "malicious"]
+        print(f"[Server] Detected malicious clients: {detected_malicious}")
+        print(f"[Server] Ground truth malicious clients: {malicious_clients}")
+
+        z_avg = torch.stack(z_list).sum(dim=0)
+        delta_flat = decoder(z_avg)
+
+        # Aggregate deltas
+        agg_delta = {k: torch.zeros_like(global_model[k]) for k in global_model}
+        model_deltas = [vector_to_state_dict(delta_flat, global_model)]
+        for delta in model_deltas:
+            for k in delta:
+                agg_delta[k] += delta[k]
+        for k in agg_delta:
+            agg_delta[k] /= len(model_deltas)
+
+        if "ema_model" not in locals():
+            ema_model = global_model.copy()
+        for k in global_model:
+            ema_model[k] = alpha * (global_model[k] + agg_delta[k]) + (1 - alpha) * ema_model[k]
+        global_model = ema_model
+
+    print("\n✅ Adaptive Server Finished.")
+    return global_model
