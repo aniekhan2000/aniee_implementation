@@ -3,6 +3,7 @@
 import torch
 import torch.nn.functional as F
 from collections import Counter
+from collections import deque
 
 # ---------- Vector <-> state_dict ----------
 def state_dict_to_vector(state_dict: dict) -> torch.Tensor:
@@ -53,7 +54,52 @@ def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     if a.numel() == 0 or b.numel() == 0:
         return 0.0
     return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=1, eps=1e-8).item()
+# ---- EMA (you already added this) ----
+class EMA:
+    def __init__(self, alpha=0.1):
+        self.alpha = alpha
+        self.value = None
 
+    def update(self, new_value):
+        if self.value is None:
+            self.value = new_value.clone()
+        else:
+            self.value = self.alpha * new_value + (1 - self.alpha) * self.value
+        return self.value
+
+# ---- Sliding Window buffers ----
+class SlidingWindow:
+    """Fixed-size deque for tensors or scalars with windowed stats."""
+    def __init__(self, maxlen: int):
+        self.buf = deque(maxlen=maxlen)
+
+    def append(self, x):
+        self.buf.append(x)
+
+    def __len__(self):
+        return len(self.buf)
+
+    def last(self, k=1):
+        if k == 1:
+            return self.buf[-1] if self.buf else None
+        return list(self.buf)[-k:]
+
+    def stack(self):
+        """Stack tensor entries -> [n, ...]."""
+        xs = [x for x in self.buf if torch.is_tensor(x)]
+        return torch.stack(xs) if xs else None
+
+    def mean(self):
+        xs = self.stack()
+        return xs.mean(dim=0) if xs is not None else None
+
+    def std(self, eps=1e-9):
+        xs = self.stack()
+        return xs.std(dim=0) if xs is not None else None
+
+# ---- Memory estimator (optional) ----
+def estimate_window_memory_mb(num_clients:int, latent_dim:int, K:int, dtype_bytes:int=4):
+    return (num_clients * latent_dim * K * dtype_bytes) / (1024*1024)
 
 # ---------- Jitter ----------
 def apply_jitter(z: torch.Tensor, noise_std: float = 0.01, k: int = 5):
@@ -90,21 +136,6 @@ def compute_weight(label: str, c_i: int, r_norm: float, flip_rate: float,
     else:  # "Pending" or unknown
         w = 0.5
     return float(max(0.0, min(w, w_honest)))
-
-
-# ---------- EMA ----------
-class EMA:
-    def __init__(self, alpha=0.1):
-        self.alpha = alpha
-        self.value = None
-
-    def update(self, x):
-        if self.value is None:
-            self.value = x.clone()
-        else:
-            self.value = self.alpha * x + (1 - self.alpha) * self.value
-        return self.value
-
 
 # ---------- Anchors ----------
 def update_anchors(anchors, new_z: torch.Tensor, alpha: float = 0.1):
