@@ -190,3 +190,398 @@ def adaptive_server(num_rounds=5, num_clients=10, malicious_clients=None, latent
 
     print("\n✅ Adaptive Server Finished.")
     return global_model
+
+***********************************************************************************************************************************
+
+
+# server/adaptive_server.py
+
+import torch
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+import numpy as np
+from collections import defaultdict, deque
+
+from server.server_utils import (
+    vector_to_state_dict,
+    compute_magnitude,
+    compute_distance,
+    cosine_similarity,
+    apply_jitter,
+    update_label,
+    compute_weight,
+    EMA,
+    SlidingWindow,
+    estimate_window_memory_mb,
+)
+from model.cnn_model import CIFAR10CNN
+from utils.encoder import LinearEncoder, LinearDecoder
+from client.client_gateway import client_gateway
+
+
+# ----------------------------
+# Data utilities
+# ----------------------------
+def get_client_dataloaders(dataset, num_clients, batch_size=64, seed=0):
+    """
+    Split a dataset into num_clients IID shards and return a dataloader per client.
+    """
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(len(dataset))
+    shards = np.array_split(indices, num_clients)
+
+    loaders = []
+    for shard in shards:
+        subset = Subset(dataset, shard.tolist())
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        loaders.append(loader)
+    return loaders
+
+
+@torch.no_grad()
+def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.device) -> float:
+    """
+    Evaluate top-1 accuracy on a dataloader.
+    """
+    model.eval()
+    correct, total = 0, 0
+    for x, y in dataloader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return 100.0 * correct / max(total, 1)
+
+
+# ----------------------------
+# Main server
+# ----------------------------
+def adaptive_server(
+    num_rounds: int = 5,
+    num_clients: int = 10,
+    malicious_clients=None,
+    latent_dim: int = 128,
+    batch_size: int = 64,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    # --- Sliding Window Params ---
+    K_round: int = 30,        # global window size over rounds
+    K_client: int = 10,       # per-client window size
+    lambda_hybrid: float = 0.5,
+    use_hybrid_anchor: bool = True,
+):
+    """
+    Federated averaging server with latent-space robustness + sliding windows:
+      - Keeps original detection/aggregation pipeline
+      - Adds global and per-client sliding windows
+      - Uses hybrid anchor (EMA + window mean)
+      - Adds per-client, window-based thresholds for magnitude and distance bounds
+    """
+    print("🚀 Starting Adaptive FedAvg Server (CIFAR-10 + Sliding Windows + Per-client thresholds)")
+
+    if malicious_clients is None:
+        malicious_clients = []
+
+    # ---- Model / Encoder-Decoder ----
+    model = CIFAR10CNN().to(device)
+    model.eval()  # server never trains directly
+    num_params = sum(p.numel() for p in model.parameters())
+    encoder = LinearEncoder(num_params, latent_dim).to(device)
+    decoder = LinearDecoder(latent_dim, num_params).to(device)
+
+    global_model = model.state_dict()  # OrderedDict of tensors (CPU by default is fine)
+    # keep on CPU for compatibility with vector_to_state_dict usage
+    global_model = {k: v.detach().cpu().clone() for k, v in global_model.items()}
+
+    # ---- CIFAR-10 Data (match CIFAR10CNN 3x32x32) ----
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2470, 0.2435, 0.2616)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2470, 0.2435, 0.2616)),
+    ])
+    trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
+    testset = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    client_dataloaders = get_client_dataloaders(trainset, num_clients=num_clients, batch_size=batch_size, seed=0)
+    testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+
+    # ---- EMA trackers (latent) ----
+    ema_mu_z_short = EMA(alpha=0.1)
+    ema_sigma_z_short = EMA(alpha=0.1)
+    ema_mu_z_long = EMA(alpha=0.01)
+
+    # ---- Sliding windows ----
+    # Global window holds per-round mean latent vector
+    win_global_mu = SlidingWindow(maxlen=K_round)
+
+    # Per-client windows for z, magnitudes, r_norms
+    win_z_client = {cid: SlidingWindow(maxlen=K_client) for cid in range(num_clients)}
+    win_mag_client = {cid: SlidingWindow(maxlen=K_client) for cid in range(num_clients)}
+    win_rn_client = {cid: SlidingWindow(maxlen=K_client) for cid in range(num_clients)}
+
+    # Label history (original) and a deque for quick stability checks
+    label_history = defaultdict(list)
+    labels_hist = {cid: deque(maxlen=3) for cid in range(num_clients)}  # m_confirm below controls the logic
+
+    # Optionally print memory estimate
+    mb = estimate_window_memory_mb(num_clients, latent_dim, K_client)
+    print(f"ℹ️ Estimated client-window memory for z: ~{mb:.2f} MB")
+
+    # ---- Detection hyperparams ----
+    tau_dir_lat = 0.80          # cosine similarity threshold
+    tau_rec_high = 180.0        # if recon error is huge -> overly diverse
+    tau_rec_low = 150.0
+    jitter_thresh = 0.30
+    m_confirm = 3               # label stability window
+    w_honest, w_diverse = 1.0, 0.7
+    alpha_weight_blend = 0.10   # weight blending in compute_weight
+
+    for rnd in range(1, num_rounds + 1):
+        print(f"\n🌐 Round {rnd}")
+        per_client = []  # will store dicts
+
+        # ---- Client stage ----
+        for cid in range(num_clients):
+            try:
+                result = client_gateway(
+                    cid=cid,
+                    global_model=global_model,          # send CURRENT global model
+                    encoder=encoder,
+                    decoder=decoder,
+                    data_loader=client_dataloaders[cid],
+                    malicious=(cid in malicious_clients),
+                    round_num=rnd,
+                    total_clients=num_clients,
+                )
+                if result is None:
+                    raise RuntimeError("Client returned None")
+
+                # Move z_tilde to CPU to keep everything consistent
+                result["z_tilde"] = result["z_tilde"].detach().cpu()
+                per_client.append((cid, result))
+
+                # --- Save to per-client sliding windows ---
+                win_z_client[cid].append(result["z_tilde"])
+                win_mag_client[cid].append(torch.tensor(result["mag_orig"]))
+                win_rn_client[cid].append(torch.tensor(result["r_norm"]))
+
+                print(f"Client {cid} → mag: {result['mag_orig']:.2f} | r_norm: {result['r_norm']:.4f}")
+
+            except Exception as e:
+                print(f"❌ Client {cid} failed: {e}")
+
+        if not per_client:
+            print("No successful clients this round; skipping update.")
+            continue
+
+        # ---- EMA on latent batches ----
+        z_batch = torch.stack([r["z_tilde"] for _, r in per_client], dim=0)  # [C, D]
+        mu_z_round = z_batch.mean(0)
+        sigma_z_round = z_batch.std(0)
+
+        mu_z_short = ema_mu_z_short.update(mu_z_round)
+        sigma_z_short = ema_sigma_z_short.update(sigma_z_round)
+        mu_z_long = ema_mu_z_long.update(mu_z_round)
+
+        # ---- Global window update & hybrid anchor ----
+        win_global_mu.append(mu_z_round)
+        mu_z_window = win_global_mu.mean() if len(win_global_mu) > 0 else mu_z_round
+
+        anchor = (
+            lambda_hybrid * mu_z_short + (1 - lambda_hybrid) * mu_z_window
+            if use_hybrid_anchor else mu_z_short
+        )
+
+        sigma_mean = max(1e-8, sigma_z_short.mean().item())
+        print(
+            f"[EMA+WIN] ||μ_ema||={mu_z_short.norm():.4f} | "
+            f"||μ_win||={mu_z_window.norm():.4f} | ||anchor||={anchor.norm():.4f} | "
+            f"σ̄={sigma_mean:.4f}"
+        )
+
+        # Global adaptive thresholds from EMA variance (baseline)
+        eps_mag_lat_global = 10.0 * sigma_mean
+        k_out_global = 20.0 * sigma_mean
+        k_in_global = 10.0 * sigma_mean
+
+        # ---- Per-client detection + weights (with window-based thresholds) ----
+        labels = []
+        weights = []
+        decoded_deltas = []
+        benign_cids = []
+
+        for (cid, result) in per_client:
+            z = result["z_tilde"]
+            r_norm = float(result["r_norm"])
+            mag_z = float(compute_magnitude(z))
+
+            # ----- Per-client window stats -----
+            # Magnitude baseline from client window
+            if len(win_mag_client[cid]) > 0:
+                mag_win_mean = win_mag_client[cid].mean().item()
+            else:
+                mag_win_mean = mag_z
+
+            # Reconstruction norm baseline from client window (not used for thresholding below, but handy)
+            if len(win_rn_client[cid]) > 0:
+                rn_win_mean = win_rn_client[cid].mean().item()
+            else:
+                rn_win_mean = r_norm
+
+            # Distances to anchor over client's window (mean + 2*std) as a personalized bound
+            # If no history, fall back to global thresholds
+            if len(win_z_client[cid]) > 0:
+                z_hist = win_z_client[cid].stack()  # [T, D]
+                # Compute distances of history to current anchor
+                dists_hist = torch.norm(z_hist - anchor, dim=1)
+                d_mean = float(dists_hist.mean().item())
+                d_std = float(dists_hist.std(unbiased=False).item())
+                k_client_bound = d_mean + 2.0 * d_std  # personalized radius
+            else:
+                k_client_bound = None
+
+            # Current distance and direction w.r.t. hybrid anchor
+            dist_norm = float(torch.norm(z - anchor).item())
+            dir_sim = float(cosine_similarity(z, anchor))
+
+            # ----- Hybrid, per-client thresholds -----
+            # Magnitude threshold blends global epsilon with client rolling mean
+            # (1.5× client mean caps magnitude drift while keeping global variance signal)
+            eps_mag_lat_client = 1.5 * max(1e-8, mag_win_mean)
+            eps_mag_lat_eff = 0.5 * eps_mag_lat_global + 0.5 * eps_mag_lat_client
+
+            # Boundary threshold blends global (k_in/k_out) with personalized radius
+            prev = label_history[cid][-1] if label_history[cid] else None
+            if prev == "Benign":
+                k_global = k_in_global
+            else:
+                k_global = k_out_global
+
+            if k_client_bound is not None:
+                # choose a conservative blend: min(global, personalized*1.2 when not yet benign)
+                k_personal = k_client_bound if prev == "Benign" else 1.2 * k_client_bound
+                k_eff = min(k_global, k_personal)
+            else:
+                k_eff = k_global
+
+            # ----- 3-criteria evaluation (with per-client thresholds) -----
+            cond_mag = (mag_z <= eps_mag_lat_eff)
+            cond_dir = (dir_sim >= tau_dir_lat)
+            cond_bound = (dist_norm <= k_eff)
+
+            c_i = int(cond_mag) + int(cond_dir) + int(cond_bound)
+            L0 = update_label(c_i)
+
+            # Reconstruction sanity (unchanged)
+            if L0 == "Benign" and r_norm > tau_rec_high:
+                L1 = "Diverse"
+            elif L0 == "Diverse" and r_norm < tau_rec_low:
+                L1 = "Diverse"
+            else:
+                L1 = L0
+
+            # Jitter robustness (uses same anchor and effective thresholds)
+            flips = 0
+            for jittered in apply_jitter(z):
+                dir_sim_j = float(cosine_similarity(jittered, anchor))
+                mag_sim_j = float(compute_magnitude(jittered))
+                dist_sim_j = float(torch.norm(jittered - anchor).item())
+
+                # Use same effective thresholds for jitter check
+                jc = int(mag_sim_j <= eps_mag_lat_eff) + int(dir_sim_j >= tau_dir_lat) + int(dist_sim_j <= k_eff)
+                if update_label(jc) != L1:
+                    flips += 1
+            flip_rate = flips / 5.0
+            L3 = "Diverse" if flip_rate > jitter_thresh else L1
+
+            # Stability window (original)
+            label_history[cid].append(L3)
+            if len(label_history[cid]) > m_confirm:
+                label_history[cid] = label_history[cid][-m_confirm:]
+            stable = (len(label_history[cid]) == m_confirm) and all(
+                lab == label_history[cid][0] for lab in label_history[cid]
+            )
+            final_label = label_history[cid][0] if stable else "Pending"
+
+ # ✅ raw magnitude safeguard
+            raw_mags = [r["mag_orig"] for _, r in per_client]
+            median_mag = np.median(raw_mags)
+            if mag_orig > 3 * median_mag:
+                final_label = "Malicious"
+
+
+            # Compute weight (original)
+            wt = compute_weight(
+                final_label, c_i, r_norm, flip_rate,
+                w_honest, w_diverse, alpha_weight_blend
+            )
+
+            print(
+                f"Client {cid} → Label: {final_label}, Weight: {wt:.4f}, "
+                f"mag: {mag_z:.2f} (winμ≈{mag_win_mean:.2f}, ε_eff≈{eps_mag_lat_eff:.2f}), "
+                f"dist: {dist_norm:.4f} (k_eff≈{k_eff:.4f}), dir: {dir_sim:.3f}, "
+                f"r_norm: {r_norm:.2f} (winμ≈{rn_win_mean:.2f})"
+            )
+
+            labels.append((cid, final_label))
+            weights.append((cid, wt))
+
+            # Decode each client's (weighted) delta now (FedAvg-style aggregation)
+            z_weighted = z * wt
+            delta_flat = decoder(z_weighted.to(device)).detach().cpu()
+            delta_sd = vector_to_state_dict(delta_flat, global_model)
+            decoded_deltas.append((cid, delta_sd))
+
+            if final_label.lower() != "malicious" and wt > 0.0:
+                benign_cids.append(cid)
+
+        detected_mal = [cid for (cid, lab) in labels if str(lab).lower() == "malicious"]
+        print(f"[Server] Detected malicious: {detected_mal}")
+        print(f"[Server] Ground truth malicious: {malicious_clients}")
+
+        # ---- Aggregate only benign/weighted deltas ----
+        # If everyone was filtered, fall back to top-weights or to mean of all
+        chosen = set(benign_cids)
+        if len(chosen) == 0:
+            # fallback: take top-50% by weight (still robust-ish)
+            sorted_by_w = sorted(weights, key=lambda x: x[1], reverse=True)
+            take = max(1, len(sorted_by_w) // 2)
+            chosen = set(cid for cid, _ in sorted_by_w[:take])
+            print(f"⚠️ No confirmed benign; fallback to top-{take} by weight: {sorted(list(chosen))}")
+
+        # Sum weighted deltas for chosen clients
+        agg_delta = {k: torch.zeros_like(v) for k, v in global_model.items()}
+        denom = 0.0
+        wdict = dict(weights)
+        for cid, delta_sd in decoded_deltas:
+            if cid in chosen:
+                wt = wdict[cid]
+                denom += max(1e-12, wt)
+                for k in agg_delta:
+                    agg_delta[k] += delta_sd[k] * wt
+
+        if denom > 0:
+            for k in agg_delta:
+                agg_delta[k] /= denom
+        else:
+            # Shouldn't happen because we forced a fallback above, but keep safe
+            for k in agg_delta:
+                agg_delta[k].zero_()
+            print("⚠️ denom=0; skipping model update this round.")
+
+        # ---- FedAvg-style model update (NO EMA of model params) ----
+        for k in global_model:
+            global_model[k] = (global_model[k] + agg_delta[k]).detach().cpu()
+
+        # ---- Evaluate updated global model ----
+        model.load_state_dict(global_model, strict=True)
+        acc = evaluate(model, testloader, device=torch.device(device))
+        print(f"✅ Test accuracy after round {rnd}: {acc:.2f}%")
+
+    print("\n✅ Adaptive Server Finished.")
+    return global_model
+
