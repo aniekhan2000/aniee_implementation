@@ -5,15 +5,22 @@ from torch.utils.data import DataLoader, Subset
 from model.cnn_model import CIFAR10CNN
 from utils.utils import load_data
 from utils.encoder import LinearEncoder, LinearDecoder
-import numpy as np
+from utils.partitions_iid import stratified_iid_indices
+from utils.partitions_dirichlet import dirichlet_noniid_indices
+from utils.partitions_structured import structured_by_key_indices
+from utils.partition_diagnostics import save_partition_report
+from data.build_loaders import build_loaders
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+# -------------------- Local Training --------------------
 def train_local(model, trainloader, epochs=1):
+    """Train a local client model for given epochs"""
     model.train()
     optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     criterion = nn.CrossEntropyLoss()
+
     for _ in range(epochs):
         for x, y in trainloader:
             x, y = x.to(DEVICE), y.to(DEVICE)
@@ -24,7 +31,9 @@ def train_local(model, trainloader, epochs=1):
             optimizer.step()
 
 
+# -------------------- Compute Client Update --------------------
 def compute_flat_update(model, global_weights):
+    """Compute flattened update vector"""
     local_weights = model.state_dict()
     update = {k: local_weights[k] - global_weights[k] for k in global_weights}
     flat_update = torch.cat([v.flatten() for v in update.values()])
@@ -32,17 +41,20 @@ def compute_flat_update(model, global_weights):
 
 
 def clip_update(update, clip_norm):
+    """Clip update vector by norm"""
     norm = torch.norm(update)
     scale = min(1.0, clip_norm / (norm + 1e-8))
     return update * scale, norm.item()
 
 
 def add_dp_noise(z, sigma):
+    """Add Gaussian noise for DP"""
     return z + torch.randn_like(z) * sigma
 
 
+# -------------------- Main Client Function --------------------
 def phase1_client(
-    client_id,
+  client_id,
     global_model,
     encoder,
     decoder=None,
@@ -54,6 +66,11 @@ def phase1_client(
     round_num=1,
     total_clients=5,
 ):
+    """
+    Simulates one FL client for Phase 1 training
+    """
+
+    # Load CIFAR-10 data
     trainset, _ = load_data()
 
     # Split dataset among clients
@@ -62,20 +79,28 @@ def phase1_client(
     client_data = Subset(trainset, indices)
     trainloader = DataLoader(client_data, batch_size=32, shuffle=True)
 
+    # Initialize client model with global weights
     model = CIFAR10CNN().to(DEVICE)
     model.load_state_dict(global_model)
 
+    # Local training
     train_local(model, trainloader, epochs=1)
 
+    # Compute update
     update = compute_flat_update(model, global_model)
 
+    # Inject malicious behavior
     if malicious:
         print(f"⚠️ Client {client_id} is malicious in round {round_num}")
-        update = update * 10  # amplify update (malicious)
+        update = update * 10  # amplify update
 
+    # Clip update
     clipped_update, mag_orig = clip_update(update, clip_norm)
+
+    # Encode update
     z = encoder(clipped_update)
 
+    # Reconstruction error (only if decoder provided)
     if decoder is not None:
         recon = decoder(z)
         rec_loss = torch.norm(clipped_update - recon)
@@ -83,8 +108,10 @@ def phase1_client(
     else:
         r_norm = 0.0
 
+    # Add DP noise
     z_tilde = add_dp_noise(z, sigma)
 
+    # Return client contribution
     return {
         "client_id": client_id,
         "z_tilde": z_tilde.detach().cpu(),
