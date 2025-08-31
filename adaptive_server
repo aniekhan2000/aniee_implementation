@@ -6,6 +6,7 @@ from torchvision import datasets, transforms
 import numpy as np
 from collections import defaultdict, deque
 
+from server.history_manager import DualEMAHistory
 from server.server_utils import (
     vector_to_state_dict,
     compute_magnitude,
@@ -17,7 +18,13 @@ from server.server_utils import (
     EMA,
     SlidingWindow,
     estimate_window_memory_mb,
+    subtract_state_dict,
+    weighted_average_updates,
+    apply_delta,
+    state_dict_l2norm,
+    add_state_dicts,
 )
+
 from model.cnn_model import CIFAR10CNN
 from utils.encoder import LinearEncoder, LinearDecoder
 from client.client_gateway import client_gateway
@@ -37,7 +44,13 @@ def get_client_dataloaders(dataset, num_clients, batch_size=64, seed=0):
     loaders = []
     for shard in shards:
         subset = Subset(dataset, shard.tolist())
-        loader = DataLoader(subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        loader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+        )
         loaders.append(loader)
     return loaders
 
@@ -69,19 +82,20 @@ def adaptive_server(
     batch_size: int = 64,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     # --- Sliding Window Params ---
-    K_round: int = 30,        # global window size over rounds
-    K_client: int = 10,       # per-client window size
+    K_round: int = 10,        # global window size over rounds
+    K_client: int = 5,       # per-client window size
     lambda_hybrid: float = 0.5,
     use_hybrid_anchor: bool = True,
 ):
     """
-    Federated averaging server with latent-space robustness + sliding windows:
-      - Keeps original detection/aggregation pipeline
-      - Adds global and per-client sliding windows
-      - Uses hybrid anchor (EMA + window mean)
-      - Adds per-client, window-based thresholds for magnitude and distance bounds
+    Federated averaging server with latent-space robustness + sliding windows + Dual EMA trust:
+      - Original detection/aggregation pipeline
+      - Global and per-client sliding windows
+      - Hybrid anchor (EMA + window mean)
+      - Per-client thresholds (magnitude, distance)
+      - Dual EMA trust that soft-downweights persistently suspicious clients
     """
-    print("🚀 Starting Adaptive FedAvg Server (CIFAR-10 + Sliding Windows + Per-client thresholds)")
+    print("🚀 Starting Adaptive FedAvg Server (CIFAR-10 + Sliding Windows + Dual EMA Trust)")
 
     if malicious_clients is None:
         malicious_clients = []
@@ -112,7 +126,7 @@ def adaptive_server(
     client_dataloaders = get_client_dataloaders(trainset, num_clients=num_clients, batch_size=batch_size, seed=0)
     testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
 
-    # ---- EMA trackers ----
+    # ---- EMA trackers for global latent stats ----
     ema_mu_z_short = EMA(alpha=0.1)
     ema_sigma_z_short = EMA(alpha=0.1)
     ema_mu_z_long = EMA(alpha=0.01)
@@ -123,28 +137,38 @@ def adaptive_server(
     win_mag_client = {cid: SlidingWindow(maxlen=K_client) for cid in range(num_clients)}
     win_rn_client = {cid: SlidingWindow(maxlen=K_client) for cid in range(num_clients)}
 
-    # Label history
+    # ---- Label history ----
     label_history = defaultdict(list)
     labels_hist = {cid: deque(maxlen=3) for cid in range(num_clients)}
 
-    # Optionally print memory estimate
+    # ---- Rough memory estimate for windows ----
     mb = estimate_window_memory_mb(num_clients, latent_dim, K_client)
     print(f"ℹ️ Estimated client-window memory for z: ~{mb:.2f} MB")
 
     # ---- Detection hyperparams ----
-    tau_dir_lat = 0.80
+    tau_dir_lat = 0.75
     tau_rec_high = 180.0
     tau_rec_low = 150.0
-    jitter_thresh = 0.30
+    jitter_thresh = 0.35
     m_confirm = 3
     w_honest, w_diverse = 1.0, 0.7
     alpha_weight_blend = 0.10
+
+    # ---- Trust history (Dual EMA over suspicion) ----
+    hist = DualEMAHistory(
+        num_clients=num_clients,
+        alpha_short=0.3,   # fast EMA
+        alpha_long=0.05,   # slow EMA
+        beta=1.0           # suspicion -> trust sharpness
+    )
 
     for rnd in range(1, num_rounds + 1):
         print(f"\n🌐 Round {rnd}")
         per_client = []
 
-        # ---- Client stage ----
+        # -------------------------
+        # Client stage
+        # -------------------------
         for cid in range(num_clients):
             try:
                 result = client_gateway(
@@ -160,9 +184,11 @@ def adaptive_server(
                 if result is None:
                     raise RuntimeError("Client returned None")
 
+                # Expected keys: z_tilde (latent), mag_orig, r_norm
                 result["z_tilde"] = result["z_tilde"].detach().cpu()
                 per_client.append((cid, result))
 
+                # Update windows
                 win_z_client[cid].append(result["z_tilde"])
                 win_mag_client[cid].append(torch.tensor(result["mag_orig"]))
                 win_rn_client[cid].append(torch.tensor(result["r_norm"]))
@@ -176,7 +202,9 @@ def adaptive_server(
             print("No successful clients this round; skipping update.")
             continue
 
-        # ---- EMA ----
+        # -------------------------
+        # Global EMA / Window anchor
+        # -------------------------
         z_batch = torch.stack([r["z_tilde"] for _, r in per_client], dim=0)
         mu_z_round = z_batch.mean(0)
         sigma_z_round = z_batch.std(0)
@@ -200,12 +228,14 @@ def adaptive_server(
             f"σ̄={sigma_mean:.4f}"
         )
 
-        # Global adaptive thresholds
+        # Global adaptive thresholds (rough heuristics)
         eps_mag_lat_global = 10.0 * sigma_mean
         k_out_global = 20.0 * sigma_mean
         k_in_global = 10.0 * sigma_mean
 
-        # ---- Detection loop ----
+        # -------------------------
+        # Detection + weighting
+        # -------------------------
         labels = []
         weights = []
         decoded_deltas = []
@@ -216,12 +246,13 @@ def adaptive_server(
             r_norm = float(result["r_norm"])
             mag_z = float(compute_magnitude(z))
 
-            # Window stats
+            # Per-client window stats
             mag_win_mean = win_mag_client[cid].mean().item() if len(win_mag_client[cid]) > 0 else mag_z
             rn_win_mean = win_rn_client[cid].mean().item() if len(win_rn_client[cid]) > 0 else r_norm
 
+            # Personal distance bound from window history
             if len(win_z_client[cid]) > 0:
-                z_hist = win_z_client[cid].stack()
+                z_hist = win_z_client[cid].stack()  # [K, latent_dim]
                 dists_hist = torch.norm(z_hist - anchor, dim=1)
                 d_mean = float(dists_hist.mean().item())
                 d_std = float(dists_hist.std(unbiased=False).item())
@@ -229,12 +260,15 @@ def adaptive_server(
             else:
                 k_client_bound = None
 
+            # Distances & dir similarity
             dist_norm = float(torch.norm(z - anchor).item())
             dir_sim = float(cosine_similarity(z, anchor))
 
+            # Effective magnitude bound mixing global & personal
             eps_mag_lat_client = 1.5 * max(1e-8, mag_win_mean)
             eps_mag_lat_eff = 0.5 * eps_mag_lat_global + 0.5 * eps_mag_lat_client
 
+            # Choose bound (tighter for previously benign, looser otherwise)
             prev = label_history[cid][-1] if label_history[cid] else None
             k_global = k_in_global if prev == "Benign" else k_out_global
             if k_client_bound is not None:
@@ -243,12 +277,14 @@ def adaptive_server(
             else:
                 k_eff = k_global
 
+            # 3 criteria → coarse label
             cond_mag = (mag_z <= eps_mag_lat_eff)
             cond_dir = (dir_sim >= tau_dir_lat)
             cond_bound = (dist_norm <= k_eff)
             c_i = int(cond_mag) + int(cond_dir) + int(cond_bound)
             L0 = update_label(c_i)
 
+            # Reconstruction-based refinement
             if L0 == "Benign" and r_norm > tau_rec_high:
                 L1 = "Diverse"
             elif L0 == "Diverse" and r_norm < tau_rec_low:
@@ -256,6 +292,7 @@ def adaptive_server(
             else:
                 L1 = L0
 
+            # Jitter stability check
             flips = 0
             for jittered in apply_jitter(z):
                 dir_sim_j = float(cosine_similarity(jittered, anchor))
@@ -267,27 +304,49 @@ def adaptive_server(
             flip_rate = flips / 5.0
             L3 = "Diverse" if flip_rate > jitter_thresh else L1
 
-            # Stability + safeguard
+            # keep short history and allow early decisions
+            m_confirm = 2  # easier to stabilize
+
             label_history[cid].append(L3)
             if len(label_history[cid]) > m_confirm:
                 label_history[cid] = label_history[cid][-m_confirm:]
-            stable = (len(label_history[cid]) == m_confirm) and all(
-                lab == label_history[cid][0] for lab in label_history[cid]
-            )
-            final_label = label_history[cid][0] if stable else "Pending"
 
+            # --- warm-up bypass: DO NOT gate by stability in rounds 1..2
+            if rnd <= 2:
+                final_label = L3                      # <-- direct (Benign/Diverse/Malicious) in rounds 1–2
+            else:
+                stable = (len(label_history[cid]) == m_confirm) and all(
+                    lab == label_history[cid][-1] for lab in label_history[cid]
+                )
+                final_label = label_history[cid][-1] if stable else f"Pending({L3})"
+
+
+            # Additional magnitude outlier safeguard
             raw_mags = [r["mag_orig"] for _, r in per_client]
             median_mag = np.median(raw_mags)
             mag_orig = result["mag_orig"]
-            if mag_orig > 3 * median_mag:
-                final_label = "Malicious"
+            if rnd >= 3 and mag_orig > 4 * median_mag:
+             final_label = "Malicious"
 
-            wt = compute_weight(final_label, c_i, r_norm, flip_rate,
-                                w_honest, w_diverse, alpha_weight_blend)
+            # --- Suspicion score + Dual EMA trust ---
+            # Combine (distance overflow), (jitter instability), (high reconstruction)
+            overflow = max(0.0, (dist_norm - k_eff) / max(k_eff, 1e-8))
+            high_rec = max(0.0, (r_norm - tau_rec_high) / max(tau_rec_high, 1e-8))
+            suspicion_i = 0.5 * overflow + 0.3 * float(flip_rate) + 0.2 * high_rec
+
+            hist.update(cid, suspicion_i)
+            trust_i = hist.get_trust(cid)  # in (0,1]; higher suspicion → lower trust
+
+            # Base weight from label/criteria, then temper by trust
+            wt_base = compute_weight(
+                final_label, c_i, r_norm, flip_rate,
+                w_honest, w_diverse, alpha_weight_blend
+            )
+            wt = float(wt_base) * float(trust_i)
 
             print(
-                f"Client {cid} → Label: {final_label}, Weight: {wt:.4f}, "
-                f"mag: {mag_z:.2f} (winμ≈{mag_win_mean:.2f}, ε_eff≈{eps_mag_lat_eff:.2f}), "
+                f"Client {cid} → Label: {final_label}, Weight: {wt:.4f}, Trust: {trust_i:.3f}, "
+                f"susp={suspicion_i:.3f}, mag: {mag_z:.2f} (winμ≈{mag_win_mean:.2f}, ε_eff≈{eps_mag_lat_eff:.2f}), "
                 f"dist: {dist_norm:.4f} (k_eff≈{k_eff:.4f}), dir: {dir_sim:.3f}, "
                 f"r_norm: {r_norm:.2f} (winμ≈{rn_win_mean:.2f})"
             )
@@ -295,8 +354,8 @@ def adaptive_server(
             labels.append((cid, final_label))
             weights.append((cid, wt))
 
-            z_weighted = z * wt
-            delta_flat = decoder(z_weighted.to(device)).detach().cpu()
+            # Decode UNWEIGHTED delta from latent, then apply weights only in aggregation (avoid double-weighting)
+            delta_flat = decoder(z.to(device)).detach().cpu()
             delta_sd = vector_to_state_dict(delta_flat, global_model)
             decoded_deltas.append((cid, delta_sd))
 
@@ -307,6 +366,7 @@ def adaptive_server(
         print(f"[Server] Detected malicious: {detected_mal}")
         print(f"[Server] Ground truth malicious: {malicious_clients}")
 
+        # Choose clients to aggregate
         chosen = set(benign_cids)
         if len(chosen) == 0:
             sorted_by_w = sorted(weights, key=lambda x: x[1], reverse=True)
@@ -314,12 +374,15 @@ def adaptive_server(
             chosen = set(cid for cid, _ in sorted_by_w[:take])
             print(f"⚠️ No confirmed benign; fallback to top-{take} by weight: {sorted(list(chosen))}")
 
+        # -------------------------
+        # Aggregation (weighted average of decoded deltas)
+        # -------------------------
         agg_delta = {k: torch.zeros_like(v) for k, v in global_model.items()}
         denom = 0.0
         wdict = dict(weights)
         for cid, delta_sd in decoded_deltas:
             if cid in chosen:
-                wt = wdict[cid]
+                wt = max(0.0, float(wdict[cid]))
                 denom += max(1e-12, wt)
                 for k in agg_delta:
                     agg_delta[k] += delta_sd[k] * wt
@@ -335,6 +398,9 @@ def adaptive_server(
         for k in global_model:
             global_model[k] = (global_model[k] + agg_delta[k]).detach().cpu()
 
+        # -------------------------
+        # Evaluation
+        # -------------------------
         model.load_state_dict(global_model, strict=True)
         acc = evaluate(model, testloader, device=torch.device(device))
         print(f"✅ Test accuracy after round {rnd}: {acc:.2f}%")
