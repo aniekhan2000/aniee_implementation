@@ -35,7 +35,56 @@ def vector_to_state_dict(vector, state_dict_template: dict) -> dict:
         raise ValueError(f"Flat vector too long: used {idx}, have {total}")
     return new_state
 
+# ---------- State-dict ops for aggregation ----------
+def state_dict_l2norm(sd):
+    """Return L2 norm of all parameters in a state_dict as a float."""
+    total = 0.0
+    for v in sd.values():
+        total += v.detach().float().pow(2).sum().item()
+    return (total ** 0.5)
 
+
+def subtract_state_dict(a, b):
+    """Return (a - b) as a new state_dict (parameter-wise)."""
+    return {k: a[k] - b[k] for k in a.keys()}
+
+
+def scale_state_dict(sd, scalar: float):
+    """Scale every tensor in a state_dict by a scalar."""
+    return {k: v * scalar for k, v in sd.items()}
+
+
+def add_state_dicts(sd_list):
+    """Element-wise sum of a list of state_dicts."""
+    out = {k: torch.zeros_like(sd_list[0][k]) for k in sd_list[0].keys()}
+    for sd in sd_list:
+        for k in out.keys():
+            out[k] += sd[k]
+    return out
+
+
+def weighted_average_updates(updates, weights):
+    """
+    Weighted average of client update state_dicts.
+
+    Args:
+        updates: Dict[cid] -> state_dict (delta updates)
+        weights: Dict[cid] -> float
+
+    Returns:
+        state_dict: weighted sum / sum(weights)
+    """
+    wsum = sum(max(0.0, float(w)) for w in weights.values()) + 1e-12
+    scaled = [
+        scale_state_dict(updates[cid], float(weights[cid]) / wsum)
+        for cid in updates.keys()
+    ]
+    return add_state_dicts(scaled)
+
+
+def apply_delta(global_sd, delta_sd):
+    """Parameter-wise update: global <- global + delta."""
+    return {k: global_sd[k] + delta_sd[k] for k in global_sd.keys()}
 # ---------- Basic metrics ----------
 def compute_magnitude(z: torch.Tensor) -> float:
     """L2 norm as a Python float."""
